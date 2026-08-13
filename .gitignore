@@ -7,4 +7,5 @@ venv/
 build/
 dist/
 callback_dump.py
-.env
+node_modules
+.gitignore
