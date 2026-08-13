@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import allowlist
 from .iocs import DEFAULT_IOC_PATTERNS
+from .progress import OnProgress, make_reporter
 from .skip_lists import SKIP_DIR_NAMES, SKIP_EXTENSIONS, SKIP_FILENAME_SUFFIXES
 
 
@@ -82,7 +83,14 @@ def scan_file(path: Path, root: Path, patterns: list[tuple[re.Pattern, str, str]
     return findings
 
 
-def scan_path(target: str | os.PathLike) -> list[IocFinding]:
+def scan_path(
+    target: str | os.PathLike,
+    on_progress: OnProgress | None = None,
+) -> list[IocFinding]:
+    """`on_progress`, if given, is called as on_progress(done, total) as
+    candidate files are scanned -- see polinrider_guard.progress -- so a
+    caller (the web UI) can show a "N/total files" progress bar.
+    """
     root = Path(target).resolve()
     entries = allowlist.load_allowlist(root)
     patterns = [(re.compile(p), desc, sev) for p, desc, sev in DEFAULT_IOC_PATTERNS]
@@ -90,9 +98,13 @@ def scan_path(target: str | os.PathLike) -> list[IocFinding]:
     if root.is_file():
         findings = scan_file(root, root.parent, patterns)
     else:
+        files = list(_iter_candidate_files(root))
+        report = make_reporter(len(files), on_progress)
+        report(0)
         findings = []
-        for path in _iter_candidate_files(root):
+        for i, path in enumerate(files, start=1):
             findings.extend(scan_file(path, root, patterns))
+            report(i)
 
     return [
         f for f in findings

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import allowlist
+from .progress import OnProgress, make_reporter
 from .skip_lists import SKIP_DIR_NAMES
 
 # extension -> (label, magic byte signatures). A file matches if it starts
@@ -176,11 +177,19 @@ def check_file(path: Path, root: Path, deep: bool = True) -> MasqueradeFinding |
         claimed_type=label,
         actual_type="unknown (magic bytes mismatch)",
         reason="magic bytes do not match declared type",
-        severity="medium",
+        severity="low",
     )
 
 
-def scan_path(target: str | os.PathLike, deep: bool = True) -> list[MasqueradeFinding]:
+def scan_path(
+    target: str | os.PathLike,
+    deep: bool = True,
+    on_progress: OnProgress | None = None,
+) -> list[MasqueradeFinding]:
+    """`on_progress`, if given, is called as on_progress(done, total) as
+    candidate files are scanned -- see polinrider_guard.progress -- so a
+    caller (the web UI) can show a "N/total files" progress bar.
+    """
     root = Path(target).resolve()
     entries = allowlist.load_allowlist(root)
 
@@ -190,11 +199,15 @@ def scan_path(target: str | os.PathLike, deep: bool = True) -> list[MasqueradeFi
             finding = None
         return [finding] if finding else []
 
+    files = list(_iter_candidate_files(root))
+    report = make_reporter(len(files), on_progress)
+    report(0)
     findings: list[MasqueradeFinding] = []
-    for path in _iter_candidate_files(root):
+    for i, path in enumerate(files, start=1):
         finding = check_file(path, root, deep=deep)
         if finding and not allowlist.is_file_allowlisted(entries, "extension_masquerade", finding.file):
             findings.append(finding)
+        report(i)
     return findings
 
 

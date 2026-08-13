@@ -52,6 +52,32 @@
   .fields { display: flex; gap: .5rem; flex-wrap: wrap; }
   .fields.hidden { display: none; }
   .hint { color: var(--muted); font-size: .75rem; flex-basis: 100%; }
+  .scanner-select {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: .6rem .7rem;
+  }
+  .scanner-select-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: .5rem;
+  }
+  .scanner-select-actions { font-size: .75rem; }
+  .scanner-select-actions a {
+    color: var(--accent);
+    text-decoration: none;
+    cursor: pointer;
+  }
+  .scanner-select-actions a:hover { text-decoration: underline; }
+  .scanner-select-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: .4rem .75rem;
+  }
+  .scanner-select-grid .checkbox-label { font-size: .8rem; }
+  #scanners-error { color: var(--critical); font-size: .75rem; margin-top: .35rem; }
+  #scanners-error.hidden { display: none; }
   input {
     background: #0b0f14;
     border: 1px solid var(--border);
@@ -184,6 +210,21 @@
   }
   .step-detail:empty { display: none; }
   .step.collapsed .step-detail { display: none; }
+  .step-progress {
+    height: 4px;
+    margin: -.15rem .9rem .6rem 2.4rem;
+    background: rgba(255, 255, 255, .08);
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .step-progress.hidden { display: none; }
+  .step.collapsed .step-progress { display: none; }
+  .step-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--accent);
+    transition: width .15s ease;
+  }
   .step-pending .step-icon::before { content: "○"; }
   .step-running .step-icon::before { content: "⟳"; display: inline-block; animation: spin 0.8s linear infinite; }
   .step-done .step-icon::before { content: "✓"; }
@@ -194,6 +235,7 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   #status, #recover-analyze-status { margin-top: 1rem; color: var(--muted); min-height: 1.4em; }
   #results { margin-top: 1.5rem; }
+  #results > .btn-secondary:first-child { margin-bottom: 1rem; }
   .summary {
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -373,6 +415,17 @@
       <label><input type="radio" name="mode" value="path"> Local path (already cloned)</label>
     </div>
 
+    <div class="scanner-select">
+      <div class="scanner-select-header">
+        <span class="field-label">Scanners to run:</span>
+        <span class="scanner-select-actions">
+          <a id="scanners-select-all">all</a> · <a id="scanners-select-none">none</a>
+        </span>
+      </div>
+      <div class="scanner-select-grid" id="scanner-checkboxes"></div>
+      <div id="scanners-error" class="hidden">Select at least one scanner.</div>
+    </div>
+
     <div id="url-fields" class="fields">
       <input name="url" type="text" placeholder="https://github.com/owner/repo.git" required autofocus>
       <input name="ref" type="text" placeholder="branch (optional)">
@@ -541,6 +594,16 @@ function renderReport(report) {
   if (report.git_skipped_reason) {
     summary.appendChild(el("div", { class: "loc", text: `git checks skipped: ${report.git_skipped_reason}` }));
   }
+  if (report.source_path) {
+    const openRootBtn = el("button", {
+      type: "button",
+      class: "view-file-btn",
+      text: "Open scanned folder",
+      title: "Reveal the scanned directory in your OS file manager",
+    });
+    openRootBtn.addEventListener("click", () => openInFileExplorer(report.source_path, null, openRootBtn));
+    summary.appendChild(openRootBtn);
+  }
   results.appendChild(summary);
 
   for (const [key, findings] of Object.entries(report.scanners || {})) {
@@ -556,6 +619,15 @@ function renderReport(report) {
         const viewBtn = el("button", { type: "button", class: "view-file-btn", text: "View file" });
         viewBtn.addEventListener("click", () => openFileViewer(report.source_path, f.file, f.line));
         row.appendChild(viewBtn);
+
+        const openBtn = el("button", {
+          type: "button",
+          class: "view-file-btn",
+          text: "Open in folder",
+          title: "Reveal this file in your OS file manager so you can edit/remove it",
+        });
+        openBtn.addEventListener("click", () => openInFileExplorer(report.source_path, f.file, openBtn));
+        row.appendChild(openBtn);
       }
       box.appendChild(row);
     }
@@ -588,6 +660,9 @@ function appendProgressSteps(containerId, idPrefix, stepOrder) {
 
     row.appendChild(header);
     row.appendChild(el("div", { class: "step-detail" }));
+    const barWrap = el("div", { class: "step-progress hidden" });
+    barWrap.appendChild(el("div", { class: "step-progress-fill" }));
+    row.appendChild(barWrap);
     progress.appendChild(row);
   }
 }
@@ -599,12 +674,23 @@ function renderProgressSkeleton(containerId, idPrefix, stepOrder) {
   appendProgressSteps(containerId, idPrefix, stepOrder);
 }
 
-function setStep(idPrefix, key, { state, label }) {
+function setStep(idPrefix, key, { state, label, fileProgress }) {
   const row = document.getElementById(`${idPrefix}-${key}`);
   if (!row) return;
   row.classList.remove("step-pending", "step-running", "step-done", "step-error");
   row.classList.add(`step-${state}`);
   if (label) row.querySelector(".step-detail").textContent = label;
+
+  const barWrap = row.querySelector(".step-progress");
+  if (barWrap) {
+    if (state === "running" && fileProgress && fileProgress.total > 0) {
+      barWrap.classList.remove("hidden");
+      const pct = Math.min(100, Math.round((fileProgress.done / fileProgress.total) * 100));
+      barWrap.querySelector(".step-progress-fill").style.width = `${pct}%`;
+    } else if (state !== "running") {
+      barWrap.classList.add("hidden");
+    }
+  }
 }
 
 function markRemainingStepsErrored(idPrefix, stepOrder) {
@@ -631,6 +717,38 @@ function updateModeVisibility() {
 form.querySelectorAll('input[name="mode"]').forEach((r) => r.addEventListener("change", updateModeVisibility));
 updateModeVisibility();
 
+// --- scanner selection: which of SCANNER_LABELS' checkboxes are on feeds
+// the "scanners" field of every scan/batch-scan request below, and (for a
+// single scan) trims the progress-step list down to what will actually run.
+const scannerCheckboxes = document.getElementById("scanner-checkboxes");
+const scannersError = document.getElementById("scanners-error");
+
+for (const key of Object.keys(SCANNER_LABELS)) {
+  const label = el("label", { class: "checkbox-label" });
+  const checkbox = el("input", { type: "checkbox" });
+  checkbox.checked = true;
+  checkbox.dataset.scannerKey = key;
+  label.appendChild(checkbox);
+  label.appendChild(el("span", { text: SCANNER_LABELS[key] }));
+  scannerCheckboxes.appendChild(label);
+}
+
+function getSelectedScanners() {
+  return [...scannerCheckboxes.querySelectorAll("input[type=checkbox]")]
+    .filter((c) => c.checked)
+    .map((c) => c.dataset.scannerKey);
+}
+
+document.getElementById("scanners-select-all").addEventListener("click", (e) => {
+  e.preventDefault();
+  scannerCheckboxes.querySelectorAll("input[type=checkbox]").forEach((c) => (c.checked = true));
+  scannersError.classList.add("hidden");
+});
+document.getElementById("scanners-select-none").addEventListener("click", (e) => {
+  e.preventDefault();
+  scannerCheckboxes.querySelectorAll("input[type=checkbox]").forEach((c) => (c.checked = false));
+});
+
 function showError(idPrefix, stepOrder, results, status, message) {
   markRemainingStepsErrored(idPrefix, stepOrder);
   status.textContent = "";
@@ -644,6 +762,12 @@ function showError(idPrefix, stepOrder, results, status, message) {
 // keeps a URL scan's clone around now instead of deleting it).
 let lastScanReport = null;
 
+// STEP_ORDER trimmed to "clone" + whatever scanners were actually selected
+// for the scan currently in flight, set at submit time below, so the
+// progress panel doesn't show pending rows for scanners that were never
+// asked to run.
+let currentStepOrder = STEP_ORDER;
+
 function handleSSELine(raw, status, results) {
   const eventMatch = /^event: (.+)$/m.exec(raw);
   const dataMatch = /^data: (.+)$/m.exec(raw);
@@ -652,14 +776,14 @@ function handleSSELine(raw, status, results) {
   const data = JSON.parse(dataMatch[1]);
 
   if (eventName === "progress") {
-    setStep("step", data.step, { state: data.done ? "done" : "running", label: data.label });
+    setStep("step", data.step, { state: data.done ? "done" : "running", label: data.label, fileProgress: data.file_progress });
     status.textContent = data.label;
   } else if (eventName === "done") {
     status.textContent = `Scanned ${data.target}`;
     lastScanReport = data;
     renderReport(data);
   } else if (eventName === "error") {
-    showError("step", STEP_ORDER, results, status, data.message);
+    showError("step", currentStepOrder, results, status, data.message);
   }
 }
 
@@ -709,7 +833,14 @@ form.addEventListener("submit", async (e) => {
   const status = document.getElementById("status");
   const results = document.getElementById("results");
 
-  const payload = {};
+  const selectedScanners = getSelectedScanners();
+  if (selectedScanners.length === 0) {
+    scannersError.classList.remove("hidden");
+    return;
+  }
+  scannersError.classList.add("hidden");
+
+  const payload = { scanners: selectedScanners };
   if (form.mode.value === "url") {
     payload.url = form.url.value.trim();
     const ref = form.ref.value.trim();
@@ -724,14 +855,15 @@ form.addEventListener("submit", async (e) => {
   status.textContent = "Starting scan...";
   results.innerHTML = "";
   hideRecoveryPanel();
-  renderProgressSkeleton("progress", "step", STEP_ORDER);
+  currentStepOrder = STEP_ORDER.filter((s) => s.key === "clone" || selectedScanners.includes(s.key));
+  renderProgressSkeleton("progress", "step", currentStepOrder);
 
   try {
     lastScanReport = null;
     await streamSSE("/api/scan/stream", payload, (raw) => handleSSELine(raw, status, results));
     if (lastScanReport && lastScanReport.source_path) showRecoveryPanel(lastScanReport.source_path);
   } catch (err) {
-    showError("step", STEP_ORDER, results, status, String(err.message || err));
+    showError("step", currentStepOrder, results, status, String(err.message || err));
   } finally {
     btn.disabled = false;
   }
@@ -799,19 +931,21 @@ function renderBatchDashboard(data) {
 }
 
 function showBatchRepoDetail(report) {
-  const results = document.getElementById("results");
-  results.innerHTML = "";
+  // renderReport() clears and rebuilds #results itself, so the back button
+  // has to be added after -- adding it first (then calling renderReport)
+  // just gets it wiped out immediately, leaving no way back to the repo
+  // list once you've viewed any single repo's report.
+  renderReport(report);
+  lastScanReport = report;
+  showRecoveryPanel(report.source_path);
 
+  const results = document.getElementById("results");
   const backBtn = el("button", { type: "button", class: "btn-secondary", text: "← Back to all repos" });
   backBtn.addEventListener("click", () => {
     hideRecoveryPanel();
     renderBatchDashboard(lastBatchResult);
   });
-  results.appendChild(backBtn);
-
-  renderReport(report);
-  lastScanReport = report;
-  showRecoveryPanel(report.source_path);
+  results.prepend(backBtn);
 }
 
 function handleBatchSSELine(raw, status, results) {
@@ -840,7 +974,7 @@ function handleBatchSSELine(raw, status, results) {
       // opposed to a repo that's still queued behind BATCH_SCAN_MAX_WORKERS
       // others and hasn't started at all, which stays "pending" until then).
       const state = !data.done ? "running" : data.error ? "error" : "done";
-      if (key) setStep("batch-step", key, { state, label: data.label });
+      if (key) setStep("batch-step", key, { state, label: data.label, fileProgress: data.file_progress });
       status.textContent = data.label;
     }
   } else if (eventName === "done") {
@@ -870,6 +1004,13 @@ document.getElementById("batch-scan-btn").addEventListener("click", async () => 
     return;
   }
 
+  const selectedScanners = getSelectedScanners();
+  if (selectedScanners.length === 0) {
+    scannersError.classList.remove("hidden");
+    return;
+  }
+  scannersError.classList.add("hidden");
+
   btn.disabled = true;
   scanBtn.disabled = true;
   status.textContent = "Starting batch scan...";
@@ -879,7 +1020,11 @@ document.getElementById("batch-scan-btn").addEventListener("click", async () => 
   renderProgressSkeleton("progress", "batch-step", [{ key: "discover", label: "Discover git repositories" }]);
 
   try {
-    await streamSSE("/api/batch-scan/stream", { path }, (raw) => handleBatchSSELine(raw, status, results));
+    await streamSSE(
+      "/api/batch-scan/stream",
+      { path, scanners: selectedScanners },
+      (raw) => handleBatchSSELine(raw, status, results)
+    );
   } catch (err) {
     status.textContent = "";
     results.innerHTML = "";
@@ -1377,6 +1522,38 @@ function renderFileViewerContent(content, targetLine) {
 
   const markEl = document.getElementById("file-viewer-target-line");
   if (markEl) markEl.scrollIntoView({ block: "center" });
+}
+
+// Reveals `repoPath` (or, if given, `filePath` within it) in the host OS's
+// native file manager -- Explorer/Finder/xdg-open's default file manager,
+// picked server-side by platform.system(), see /api/open-folder. Lets a
+// developer jump straight from a finding to actually deleting/editing the
+// flagged file instead of hunting for the path by hand.
+async function openInFileExplorer(repoPath, filePath, btn) {
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Opening…";
+  try {
+    const body = { path: repoPath };
+    if (filePath) body.file = filePath;
+    const resp = await fetch("/api/open-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+    btn.textContent = "Opened";
+  } catch (err) {
+    btn.textContent = "Failed";
+    btn.title = String(err.message || err);
+  } finally {
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = originalText;
+      btn.title = "";
+    }, 2000);
+  }
 }
 
 async function openFileViewer(repoPath, filePath, line) {
