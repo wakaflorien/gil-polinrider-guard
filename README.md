@@ -55,6 +55,15 @@ pip install -e ".[web]"
 polinrider-guard-web              # open http://127.0.0.1:8765
 ```
 
+> **Windows note:** if `polinrider-guard-web` isn't found after install, pip put
+> the console scripts in a `Scripts` folder that isn't on `PATH` (pip prints a
+> warning naming the folder when this happens). Either add that folder to
+> `PATH`, or run the module directly instead:
+>
+> ```bash
+> python -m polinrider_guard.webapp
+> ```
+
 or with Docker Compose (no local Python needed):
 
 ```bash

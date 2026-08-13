@@ -196,6 +196,45 @@ def test_padding_scanner_finds_whitespace_padded_payload(tmp_path):
     assert findings[0].severity == "high"
 
 
+def test_padding_scanner_ignores_leading_indentation(tmp_path):
+    # Real false positive: a hand-aligned JS continuation line indented to
+    # line up with the statement above it -- 80+ leading spaces but no real
+    # content before the gap, unlike the actual attack shape (payload
+    # appended after legitimate code on the same line).
+    js = (
+        "const details = fetchDetails(row.details)\n"
+        + " " * 98
+        + ".then(result => render(result));\n"
+    )
+    (tmp_path / "view.js").write_text(js)
+    assert scan_padding.scan_path(tmp_path) == []
+
+
+def test_padding_scanner_only_scans_js_family_files(tmp_path):
+    # The whitespace-padding hiding technique this scanner targets is
+    # JS-specific (see module docstring) -- non-JS files aren't walked at
+    # all, regardless of content, so vendored/minified CSS/SVG/etc. assets
+    # (the recurring real-world noise source) never reach either heuristic.
+    payload_line = "export default [];" + " " * 200 + 'global.i="A8-3955";'
+    (tmp_path / "style.css").write_text(payload_line)
+    (tmp_path / "view.php").write_text(payload_line)
+    assert scan_padding.scan_path(tmp_path) == []
+
+
+def test_padding_scanner_finds_whitespace_padded_payload_on_last_line(tmp_path):
+    # Same signal as test_padding_scanner_finds_whitespace_padded_payload,
+    # but the padded line is the file's last line with no trailing newline
+    # -- guards against a splitlines()-related edge case at EOF.
+    payload_line = "export default [];" + " " * 200 + 'global.i="A8-3955";'
+    (tmp_path / "eslint.config.mjs").write_text(
+        "const a = 1;\nconst b = 2;\n" + payload_line
+    )
+    findings = scan_padding.scan_path(tmp_path)
+    assert len(findings) == 1
+    assert findings[0].line == 3
+    assert findings[0].kind == "excessive_whitespace_padding"
+
+
 def test_padding_scanner_finds_line_length_outlier(tmp_path):
     normal_lines = "\n".join(f"const x{i} = {i};" for i in range(10))
     huge_line = "const payload = '" + ("A" * 3000) + "';"
@@ -209,6 +248,44 @@ def test_padding_scanner_finds_line_length_outlier(tmp_path):
 def test_padding_scanner_clean_on_normal_file(tmp_path):
     (tmp_path / "app.js").write_text("\n".join(f"const x{i} = {i};" for i in range(20)) + "\n")
     assert scan_padding.scan_path(tmp_path) == []
+
+
+def test_padding_scanner_ignores_outlier_in_licensed_vendor_bundle(tmp_path):
+    # Real false positive: a widely-distributed minified library (Socket.IO)
+    # that opens with a terser/uglify/rollup-preserved "/*!" license banner
+    # -- a much stronger signal of "distributed third-party code" than a
+    # ".min.js" filename convention, which this project deliberately does
+    # NOT trust alone (see SKIP_FILENAME_SUFFIXES in skip_lists.py).
+    banner = (
+        "/*!\n"
+        " * Socket.IO v4.7.5\n"
+        " * (c) 2014-2024 Guillermo Rauch\n"
+        " * Released under the MIT License.\n"
+        " */\n"
+    )
+    huge_line = '!function(e,t){"object"==typeof exports' + ("x" * 3000) + "}();"
+    (tmp_path / "socket.io.min.js").write_text(banner + huge_line + "\n")
+    assert scan_padding.scan_path(tmp_path) == []
+
+
+def test_padding_scanner_still_finds_padding_in_licensed_vendor_bundle(tmp_path):
+    # The license-banner exemption above only silences the softer
+    # line_length_outlier signal -- the high-confidence whitespace-padding
+    # check still runs even on a file with a license banner, since a real
+    # supply-chain attack could tamper with a genuine vendor file (banner
+    # intact) rather than adding a whole new one.
+    banner = (
+        "/*!\n"
+        " * Socket.IO v4.7.5\n"
+        " * (c) 2014-2024 Guillermo Rauch\n"
+        " * Released under the MIT License.\n"
+        " */\n"
+    )
+    tampered = banner + "const x = 1;" + " " * 200 + 'global.i="A8-3955";\n'
+    (tmp_path / "socket.io.min.js").write_text(tampered)
+    findings = scan_padding.scan_path(tmp_path)
+    assert len(findings) == 1
+    assert findings[0].kind == "excessive_whitespace_padding"
 
 
 def test_padding_scanner_ignores_uniformly_minified_file(tmp_path):
