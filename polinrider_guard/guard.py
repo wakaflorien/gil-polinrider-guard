@@ -10,7 +10,9 @@ import json as jsonlib
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
+from typing import Callable
 
 from . import (
     scan_clock_tamper,
@@ -35,6 +37,17 @@ SCANNER_STEPS: list[tuple[str, str]] = [
     ("ioc_literal_match", "Known IOC strings (C2 domains, loader markers)"),
     ("commit_camouflage", "Commit camouflage (mass-touch decoy commit)"),
 ]
+
+# Scanners whose scan_path() accepts an on_progress(done, total) callback --
+# the ones that walk a large, open-ended set of candidate files. vscode_tasks
+# (a handful of tasks.json files via rglob) and commit_camouflage (one `git
+# log` call, not a file walk) aren't file-count-shaped in the same way, so
+# they're left out. Shared with polinrider_guard.webapp so both the
+# single-scan and batch-scan progress feeds agree on which scanners can
+# report a "N/total files" progress bar.
+PROGRESS_CAPABLE_SCANNERS = {
+    "extension_masquerade", "hidden_payload_padding", "clock_tamper_tooling", "ioc_literal_match",
+}
 
 
 def build_report(
@@ -71,43 +84,75 @@ def build_report(
     return report
 
 
-def run_guard(target: str | os.PathLike, include_git: bool = True) -> dict:
+def run_guard(
+    target: str | os.PathLike,
+    include_git: bool = True,
+    scanners: list[str] | None = None,
+    on_progress: Callable[[str, int, int], None] | None = None,
+) -> dict:
+    """Run the scanners against `target`.
+
+    `scanners`, if given, restricts the run to that subset of SCANNER_STEPS
+    keys (e.g. from a web UI's checkbox selection) instead of running all of
+    them; unknown keys are ignored. Skipped scanners are reported as empty
+    findings lists rather than omitted, so the report shape stays identical
+    regardless of what was selected.
+
+    `on_progress`, if given, is called as on_progress(scanner_key, done,
+    total) from inside each progress-capable scanner's own worker thread as
+    it walks its candidate files (see PROGRESS_CAPABLE_SCANNERS and
+    polinrider_guard.progress) -- e.g. so a batch-scan caller can aggregate
+    per-repo file-scan progress across scanners. Since scanners run
+    concurrently, `on_progress` may be called from multiple threads at
+    once; a caller with shared/mutable state to update in it is
+    responsible for its own thread-safety there.
+    """
     root = Path(target).resolve()
+    all_keys = [key for key, _ in SCANNER_STEPS]
+    selected = [key for key in all_keys if scanners is None or key in scanners]
+
+    def _task(key: str, fn) -> Callable[[], object]:
+        if key in PROGRESS_CAPABLE_SCANNERS and on_progress is not None:
+            return lambda: fn(root, on_progress=partial(on_progress, key))
+        return lambda: fn(root)
 
     # Each scanner does its own independent os.walk (some also shell out to
     # git) over the same read-only tree -- nothing shared/mutable between
     # them, so running them concurrently is safe and, for a large repo,
     # meaningfully faster than the equivalent sequential sum.
-    tasks: dict[str, object] = {
-        "extension_masquerade": lambda: scan_masquerade.scan_path(root),
-        "vscode_tasks": lambda: scan_vscode.scan_path(root),
-        "hidden_payload_padding": lambda: scan_padding.scan_path(root),
-        "clock_tamper_tooling": lambda: scan_clock_tamper.scan_path(root),
-        "ioc_literal_match": lambda: scan_ioc.scan_path(root),
+    scan_funcs = {
+        "extension_masquerade": scan_masquerade.scan_path,
+        "vscode_tasks": scan_vscode.scan_path,
+        "hidden_payload_padding": scan_padding.scan_path,
+        "clock_tamper_tooling": scan_clock_tamper.scan_path,
+        "ioc_literal_match": scan_ioc.scan_path,
+        "commit_camouflage": scan_commit_camouflage.scan_path,
     }
-    if include_git:
-        tasks["commit_camouflage"] = lambda: scan_commit_camouflage.scan_path(root)
+    all_tasks: dict[str, object] = {key: _task(key, fn) for key, fn in scan_funcs.items()}
+    tasks = {key: fn for key, fn in all_tasks.items() if key in selected}
+    if "commit_camouflage" in tasks and not include_git:
+        del tasks["commit_camouflage"]
 
-    scanners: dict[str, list[dict]] = {}
+    findings: dict[str, list[dict]] = {key: [] for key in all_keys}
     git_skipped_reason = None
 
-    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-        futures = {key: executor.submit(fn) for key, fn in tasks.items()}
-        for key, future in futures.items():
-            if key == "commit_camouflage":
-                try:
-                    scanners[key] = [f.to_dict() for f in future.result()]
-                except scan_commit_camouflage.NotAGitRepoError:
-                    scanners[key] = []
-                    git_skipped_reason = "not a git repository"
-            else:
-                scanners[key] = [f.to_dict() for f in future.result()]
+    if tasks:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            futures = {key: executor.submit(fn) for key, fn in tasks.items()}
+            for key, future in futures.items():
+                if key == "commit_camouflage":
+                    try:
+                        findings[key] = [f.to_dict() for f in future.result()]
+                    except scan_commit_camouflage.NotAGitRepoError:
+                        findings[key] = []
+                        git_skipped_reason = "not a git repository"
+                else:
+                    findings[key] = [f.to_dict() for f in future.result()]
 
-    if not include_git:
-        scanners["commit_camouflage"] = []
+    if "commit_camouflage" in selected and not include_git:
         git_skipped_reason = "--no-git"
 
-    return build_report(root, scanners, git_skipped_reason)
+    return build_report(root, findings, git_skipped_reason)
 
 
 def _print_text_report(report: dict) -> None:
@@ -172,12 +217,20 @@ def main(argv: list[str] | None = None) -> int:
         prog="polinrider-guard",
         description="Run all PolinRider detection scanners against a path and produce a combined report.",
     )
+    scanner_keys = [key for key, _ in SCANNER_STEPS]
     parser.add_argument("path", help="File or directory to scan")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text")
     parser.add_argument("--no-git", action="store_true", help="Skip git history checks")
+    parser.add_argument(
+        "--scanners",
+        metavar="KEY",
+        choices=scanner_keys,
+        nargs="+",
+        help=f"Only run these scanners (default: all). Choices: {', '.join(scanner_keys)}",
+    )
     args = parser.parse_args(argv)
 
-    report = run_guard(args.path, include_git=not args.no_git)
+    report = run_guard(args.path, include_git=not args.no_git, scanners=args.scanners)
 
     if args.json:
         print(jsonlib.dumps(report, indent=2))

@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import allowlist
+from .progress import OnProgress, make_reporter
 from .skip_lists import SKIP_DIR_NAMES
 
 SCRIPT_EXTENSIONS = {".bat", ".cmd", ".ps1", ".psm1", ".sh", ".bash"}
@@ -92,7 +93,14 @@ def check_file(path: Path, root: Path) -> ClockTamperFinding | None:
     return ClockTamperFinding(file=str(path.relative_to(root)), indicators=indicators)
 
 
-def scan_path(target: str | os.PathLike) -> list[ClockTamperFinding]:
+def scan_path(
+    target: str | os.PathLike,
+    on_progress: OnProgress | None = None,
+) -> list[ClockTamperFinding]:
+    """`on_progress`, if given, is called as on_progress(done, total) as
+    candidate files are scanned -- see polinrider_guard.progress -- so a
+    caller (the web UI) can show a "N/total files" progress bar.
+    """
     root = Path(target).resolve()
     entries = allowlist.load_allowlist(root)
 
@@ -102,11 +110,15 @@ def scan_path(target: str | os.PathLike) -> list[ClockTamperFinding]:
             finding = None
         return [finding] if finding else []
 
+    files = list(_iter_candidate_files(root))
+    report = make_reporter(len(files), on_progress)
+    report(0)
     findings: list[ClockTamperFinding] = []
-    for path in _iter_candidate_files(root):
+    for i, path in enumerate(files, start=1):
         finding = check_file(path, root)
         if finding and not allowlist.is_file_allowlisted(entries, "clock_tamper_tooling", finding.file):
             findings.append(finding)
+        report(i)
     return findings
 
 

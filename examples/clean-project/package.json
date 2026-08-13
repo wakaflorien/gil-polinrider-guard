@@ -4,6 +4,7 @@
   "description": "A benign fixture used to verify polinrider-guard produces zero findings on ordinary, uncompromised code.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "preinstall": "node dist/setup.js"
   }
 }

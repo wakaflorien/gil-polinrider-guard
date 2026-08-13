@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json as jsonlib
 import os
+import platform
 import queue
 import re
 import shutil
@@ -34,7 +35,7 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Generator, Iterator
+from typing import Callable, Generator, Iterator
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import FastAPI, HTTPException
@@ -51,7 +52,7 @@ from . import (
     scan_padding,
     scan_vscode,
 )
-from .guard import SCANNER_STEPS, build_report
+from .guard import PROGRESS_CAPABLE_SCANNERS, SCANNER_STEPS, build_report
 from .skip_lists import SKIP_DIR_NAMES
 
 # Recovery (history rewrite / force-push) is the one operation in this whole
@@ -86,8 +87,9 @@ _SCAN_FUNCS = {
     "ioc_literal_match": scan_ioc.scan_path,
 }
 
-
-def _run_one_scanner(key: str, root: Path) -> tuple[str, list[dict], str | None]:
+def _run_one_scanner(
+    key: str, root: Path, on_progress: Callable[[int, int], None] | None = None
+) -> tuple[str, list[dict], str | None]:
     """Run a single scanner, returning (step key, findings-as-dicts,
     git_skipped_reason). Runs in a worker thread -- see _run_scan.
     """
@@ -96,7 +98,10 @@ def _run_one_scanner(key: str, root: Path) -> tuple[str, list[dict], str | None]
             return key, [f.to_dict() for f in scan_commit_camouflage.scan_path(root)], None
         except scan_commit_camouflage.NotAGitRepoError:
             return key, [], "not a git repository"
-    return key, [f.to_dict() for f in _SCAN_FUNCS[key](root)], None
+    fn = _SCAN_FUNCS[key]
+    if key in PROGRESS_CAPABLE_SCANNERS:
+        return key, [f.to_dict() for f in fn(root, on_progress=on_progress)], None
+    return key, [f.to_dict() for f in fn(root)], None
 
 # Remote git URLs only (http/https/git/ssh, or scp-style git@host:path).
 # Deliberately rejects bare filesystem paths and file:// here -- that's what
@@ -123,11 +128,26 @@ class ScanRequest(BaseModel):
     ref: str | None = None
     path: str | None = None
     token: str | None = None
+    scanners: list[str] | None = None
+
+
+_VALID_SCANNER_KEYS = {key for key, _ in SCANNER_STEPS}
+
+
+def _validate_scanners(scanners: list[str] | None) -> None:
+    if scanners is None:
+        return
+    if not scanners:
+        raise HTTPException(400, "scanners, if provided, must not be empty")
+    unknown = sorted(set(scanners) - _VALID_SCANNER_KEYS)
+    if unknown:
+        raise HTTPException(400, f"unknown scanner(s): {', '.join(unknown)}")
 
 
 def _validate_request(req: ScanRequest) -> None:
     has_url = bool(req.url and req.url.strip())
     has_path = bool(req.path and req.path.strip())
+    _validate_scanners(req.scanners)
 
     if has_url and has_path:
         raise HTTPException(400, "provide either a git url or a local path, not both")
@@ -206,31 +226,53 @@ def _iter_git_repos(root: Path) -> Iterator[Path]:
     scanners themselves skip (node_modules, vendor, build output, caches),
     plus a hard cap on total directories visited, so this can't get stuck
     walking a huge tree that isn't actually full of separate repos.
+
+    Uses os.scandir() rather than Path.iterdir()/Path.is_dir(): scandir's
+    DirEntry caches the file-type bit the OS already returned from the
+    directory listing itself (FindFirstFile/FindNextFile on Windows,
+    getdents on Linux), so is_dir() and the ".git" check below cost no
+    extra stat syscalls. Skip-listed names are filtered before that check
+    so they're never stat'd at all. Traversal is an explicit stack instead
+    of a recursive generator to avoid Python call/frame overhead on deep
+    trees; subdirectories are pushed in reverse sorted order so popping
+    still visits them in the same sorted depth-first order as before.
     """
     visited = 0
+    stack: list[Path] = [root]
 
-    def _walk(d: Path) -> Iterator[Path]:
-        nonlocal visited
-        if (d / ".git").exists():
-            yield d
-            return
+    while stack:
+        d = stack.pop()
         try:
-            children = sorted(p for p in d.iterdir() if p.is_dir())
+            with os.scandir(d) as it:
+                entries = list(it)
         except (OSError, PermissionError):
-            return
-        for child in children:
-            if child.name in SKIP_DIR_NAMES:
+            continue
+
+        if any(e.name == ".git" for e in entries):
+            yield d
+            continue
+
+        subdirs = []
+        for entry in entries:
+            if entry.name in SKIP_DIR_NAMES:
                 continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(entry)
+            except OSError:
+                continue
+        subdirs.sort(key=lambda e: e.name, reverse=True)
+
+        for entry in subdirs:
             visited += 1
             if visited > MAX_BATCH_DIRS_VISITED:
                 return
-            yield from _walk(child)
-
-    yield from _walk(root)
+            stack.append(Path(entry.path))
 
 
 class BatchScanRequest(BaseModel):
     path: str
+    scanners: list[str] | None = None
 
 
 def _validate_batch_scan_path(path: str) -> Path:
@@ -242,7 +284,7 @@ def _validate_batch_scan_path(path: str) -> Path:
     return p.resolve()
 
 
-def _run_batch_scan(root: Path) -> Generator[tuple[str, dict], None, None]:
+def _run_batch_scan(root: Path, scanners: list[str] | None = None) -> Generator[tuple[str, dict], None, None]:
     """Discover every git repo under `root`, then scan each one with the
     same run_guard() pipeline the CLI and single-repo web scan use,
     streaming a "started" progress event the moment a repo's scan actually
@@ -292,8 +334,31 @@ def _run_batch_scan(root: Path) -> Generator[tuple[str, dict], None, None]:
 
     def _scan_one(repo_path: Path) -> None:
         event_queue.put(("started", repo_path, None))
+
+        # guard.run_guard() runs this repo's scanners concurrently, each in
+        # its own worker thread, so on_progress can be called from several
+        # threads at once -- the lock protects the two dicts it accumulates
+        # into. Aggregated across scanners rather than reported individually:
+        # the batch table has one row per repo, not one row per scanner
+        # within a repo, so "done/total files across every progress-capable
+        # scanner this repo is running" is what actually fits that row. A
+        # scanner's total only enters the sums once it's discovered its own
+        # candidate-file count, so the aggregate total can grow as more
+        # scanners report in, same as any partial-information progress bar.
+        progress_lock = threading.Lock()
+        scanner_totals: dict[str, int] = {}
+        scanner_done: dict[str, int] = {}
+
+        def on_progress(scanner_key: str, done: int, total: int) -> None:
+            with progress_lock:
+                scanner_totals[scanner_key] = total
+                scanner_done[scanner_key] = done
+                agg_done = sum(scanner_done.values())
+                agg_total = sum(scanner_totals.values())
+            event_queue.put(("repo_progress", repo_path, (agg_done, agg_total)))
+
         try:
-            report = guard.run_guard(repo_path, include_git=True)
+            report = guard.run_guard(repo_path, include_git=True, scanners=scanners, on_progress=on_progress)
         except Exception as exc:
             event_queue.put(("error", repo_path, exc))
             return
@@ -311,6 +376,17 @@ def _run_batch_scan(root: Path) -> Generator[tuple[str, dict], None, None]:
                 yield (
                     "progress",
                     {"step": "repo", "repo_path": str(repo_path), "label": f"{repo_path.name}: scanning..."},
+                )
+            elif kind == "repo_progress":
+                done, total = payload
+                yield (
+                    "progress",
+                    {
+                        "step": "repo",
+                        "repo_path": str(repo_path),
+                        "label": f"{repo_path.name}: {done}/{total} files scanned",
+                        "file_progress": {"done": done, "total": total},
+                    },
                 )
             elif kind == "error":
                 remaining -= 1
@@ -360,10 +436,11 @@ def _run_batch_scan(root: Path) -> Generator[tuple[str, dict], None, None]:
 
 @app.post("/api/batch-scan")
 def batch_scan(req: BatchScanRequest) -> JSONResponse:
+    _validate_scanners(req.scanners)
     root = _validate_batch_scan_path(req.path)
 
     result = None
-    for event, data in _run_batch_scan(root):
+    for event, data in _run_batch_scan(root, req.scanners):
         if event == "done":
             result = data
     return JSONResponse(result)
@@ -371,10 +448,11 @@ def batch_scan(req: BatchScanRequest) -> JSONResponse:
 
 @app.post("/api/batch-scan/stream")
 def batch_scan_stream(req: BatchScanRequest) -> StreamingResponse:
+    _validate_scanners(req.scanners)
     root = _validate_batch_scan_path(req.path)
 
     def generate():
-        for event, data in _run_batch_scan(root):
+        for event, data in _run_batch_scan(root, req.scanners):
             yield _sse(event, data)
 
     return StreamingResponse(
@@ -385,7 +463,11 @@ def batch_scan_stream(req: BatchScanRequest) -> StreamingResponse:
 
 
 def _run_scan(
-    url: str | None, ref: str | None, path: str | None, token: str | None
+    url: str | None,
+    ref: str | None,
+    path: str | None,
+    token: str | None,
+    scanners: list[str] | None = None,
 ) -> Generator[tuple[str, dict], None, None]:
     """Do the clone-or-locate + scan work, yielding (event, data) pairs:
     any number of "progress" events, then exactly one "done" (with the
@@ -394,6 +476,10 @@ def _run_scan(
     Used by both /api/scan (JSON) and /api/scan/stream (SSE) so the two
     endpoints can't drift -- the JSON one just drains this generator and
     keeps the last done/error instead of re-implementing the scan.
+
+    `scanners`, if given, restricts which of SCANNER_STEPS actually run
+    (a user's checkbox selection in the UI); the rest are reported with
+    an empty findings list so the report shape is unaffected by selection.
     """
     global _last_scan_clone
 
@@ -453,7 +539,13 @@ def _run_scan(
         with _last_scan_clone_lock:
             _last_scan_clone = tmpdir
 
-    scanners: dict[str, list[dict]] = {}
+    # Scanners the caller didn't select are reported as an empty findings
+    # list rather than omitted, so the report shape (and STEP_ORDER-driven
+    # UI) doesn't have to special-case a partial run.
+    selected_steps = [(key, label) for key, label in SCANNER_STEPS if scanners is None or key in scanners]
+    scanner_results: dict[str, list[dict]] = {
+        key: [] for key, _ in SCANNER_STEPS if scanners is not None and key not in scanners
+    }
     labels = dict(SCANNER_STEPS)
     git_skipped_reason = None
 
@@ -463,28 +555,70 @@ def _run_scan(
     # stream each one's "done" event the moment it actually finishes,
     # in whichever order that turns out to be, rather than the fixed
     # SCANNER_STEPS order a sequential run would force.
-    for key, label in SCANNER_STEPS:
+    for key, label in selected_steps:
         yield ("progress", {"step": key, "label": f"Running {label}..."})
 
-    with ThreadPoolExecutor(max_workers=len(SCANNER_STEPS)) as executor:
-        futures = {executor.submit(_run_one_scanner, key, root): key for key, _ in SCANNER_STEPS}
-        for future in as_completed(futures):
-            key, findings, skip_reason = future.result()
-            scanners[key] = findings
-            if skip_reason:
-                git_skipped_reason = skip_reason
-            label = labels[key]
-            yield (
-                "progress",
-                {
-                    "step": key,
-                    "label": f"{label}: {len(findings)} finding(s)",
-                    "done": True,
-                    "count": len(findings),
-                },
-            )
+    # Progress-capable scanners (see _PROGRESS_CAPABLE_SCANNERS) call
+    # on_progress(done, total) from inside their own worker thread as they
+    # walk their candidate files -- routed through a thread-safe queue
+    # (same pattern as _run_batch_scan's event_queue) so each file-progress
+    # tick can be streamed to the browser the moment it happens, rather than
+    # only surfacing once the whole scanner finishes the way a plain
+    # as_completed() loop would. A scanner exception is put on the queue
+    # too (instead of raised directly in the worker thread) and re-raised
+    # here in the generator thread, so it still propagates exactly like an
+    # unhandled future.result() exception would have.
+    event_queue: queue.Queue = queue.Queue()
 
-    report = build_report(root, scanners, git_skipped_reason)
+    def _run(key: str) -> None:
+        def on_progress(done: int, total: int) -> None:
+            event_queue.put(("file_progress", key, done, total))
+
+        try:
+            _, findings, skip_reason = _run_one_scanner(key, root, on_progress=on_progress)
+        except Exception as exc:  # noqa: BLE001 -- re-raised verbatim below
+            event_queue.put(("scanner_error", key, exc, None))
+            return
+        event_queue.put(("scanner_done", key, findings, skip_reason))
+
+    with ThreadPoolExecutor(max_workers=max(len(selected_steps), 1)) as executor:
+        for key, _ in selected_steps:
+            executor.submit(_run, key)
+
+        remaining = len(selected_steps)
+        while remaining > 0:
+            kind, key, a, b = event_queue.get()
+            label = labels[key]
+            if kind == "file_progress":
+                done, total = a, b
+                yield (
+                    "progress",
+                    {
+                        "step": key,
+                        "label": f"{label}: {done}/{total} files scanned",
+                        "file_progress": {"done": done, "total": total},
+                    },
+                )
+            elif kind == "scanner_error":
+                raise a
+            else:  # "scanner_done"
+                remaining -= 1
+                findings = a
+                skip_reason = b
+                scanner_results[key] = findings
+                if skip_reason:
+                    git_skipped_reason = skip_reason
+                yield (
+                    "progress",
+                    {
+                        "step": key,
+                        "label": f"{label}: {len(findings)} finding(s)",
+                        "done": True,
+                        "count": len(findings),
+                    },
+                )
+
+    report = build_report(root, scanner_results, git_skipped_reason)
     if url:
         report["source_url"] = url
     report["source_path"] = str(root)
@@ -501,7 +635,7 @@ def scan(req: ScanRequest) -> JSONResponse:
 
     report = None
     error_message = None
-    for event, data in _run_scan(req.url, req.ref, req.path, req.token):
+    for event, data in _run_scan(req.url, req.ref, req.path, req.token, req.scanners):
         if event == "done":
             report = data
         elif event == "error":
@@ -517,7 +651,7 @@ def scan_stream(req: ScanRequest) -> StreamingResponse:
     _validate_request(req)
 
     def generate():
-        for event, data in _run_scan(req.url, req.ref, req.path, req.token):
+        for event, data in _run_scan(req.url, req.ref, req.path, req.token, req.scanners):
             yield _sse(event, data)
 
     return StreamingResponse(
@@ -986,6 +1120,90 @@ def view_file(path: str, file: str) -> JSONResponse:
     truncated = len(raw) > MAX_FILE_VIEW_BYTES
     content = raw[:MAX_FILE_VIEW_BYTES].decode("utf-8", errors="replace")
     return JSONResponse({"content": content, "binary": False, "truncated": truncated, "size": len(raw)})
+
+
+class OpenFolderRequest(BaseModel):
+    path: str
+    file: str | None = None
+
+
+@app.post("/api/open-folder")
+def open_folder(req: OpenFolderRequest) -> JSONResponse:
+    """Reveal the scanned directory -- or one finding's file within it --
+    in the host OS's native file manager, so a developer can go remove or
+    edit what a finding flagged without hunting for the path by hand.
+
+    Fire-and-forget: launches a GUI file manager on the machine actually
+    running the server and returns immediately, same trust boundary as
+    /api/browse and /api/file (loopback-only tool; `path`/`file` are
+    resolved and escape-checked the same way the file viewer does it,
+    since this only differs from that endpoint in what it does with the
+    resolved path -- open it in a window instead of reading its bytes).
+    Only meaningful with a desktop session; running this against a
+    headless server or the Docker image's container isn't supported (no
+    display to open a window on) and fails with a clear error instead of
+    hanging.
+    """
+    root = Path(req.path)
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(400, f"path does not exist or is not a directory: {root}")
+    root = root.resolve()
+
+    target = root
+    select = False
+    if req.file:
+        if Path(req.file).is_absolute():
+            raise HTTPException(400, "file must be a relative path")
+        candidate = (root / req.file).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            raise HTTPException(400, "file must be a path inside the scanned directory")
+        if candidate.exists():
+            target = candidate
+            select = True
+        # else: the file's already gone (e.g. already removed) -- fall back
+        # to opening the containing folder rather than erroring.
+
+    system = platform.system()
+    try:
+        if system == "Windows":
+            # Windows' foreground-lock timeout normally blocks a background
+            # process (this server, spawned off a browser click) from
+            # popping its new window in front of whatever's currently
+            # focused -- the explorer window would otherwise open behind
+            # the browser instead of "taking the screen". ASFW_ANY (-1)
+            # grants the *next* SetForegroundWindow call (explorer's own,
+            # once its window exists) a one-time exemption from that lock.
+            import ctypes
+
+            ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+
+            # Passed as a single command string, not an argv list: explorer's
+            # /select,"path" parsing wants the comma and the quoted path
+            # contiguous with no space, which list2cmdline's own quoting
+            # wouldn't preserve.
+            if select:
+                subprocess.Popen(f'explorer /select,"{target}"')
+            else:
+                subprocess.Popen(["explorer", str(target)])
+        elif system == "Darwin":
+            subprocess.Popen(["open", "-R", str(target)] if select else ["open", str(target)])
+        else:
+            if shutil.which("xdg-open") is None:
+                raise HTTPException(
+                    501,
+                    "no desktop file manager available on this host (xdg-open not found) "
+                    "-- likely running headless or inside a container without a display",
+                )
+            # xdg-open has no cross-desktop "select this file" convention,
+            # so the best it can do is open the containing folder.
+            folder = target if target.is_dir() else target.parent
+            subprocess.Popen(["xdg-open", str(folder)])
+    except FileNotFoundError:
+        raise HTTPException(501, f"could not launch a file manager for this OS ({system})")
+
+    return JSONResponse({"opened": str(target)})
 
 
 def _list_windows_drives() -> list[dict]:
